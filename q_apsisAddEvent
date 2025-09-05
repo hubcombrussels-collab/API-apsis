@@ -1,0 +1,102 @@
+async function addCustomEvent() {
+  const first = (...vals) => vals.find(v => v !== undefined && v !== null && v !== "");
+
+  // 1) row & email
+  const sr = tbl_results.selectedRow || {};
+  const rawEmail = first(
+    sr.Email, sr.email, sr["Email"], sr["email"],
+    sr.data?.Email, sr.data?.email, sr.original?.Email, sr.original?.email
+  );
+  if (!rawEmail) {
+    utils.showNotification({ title: "No email", description: "Select a row with an email.", notificationType: "error" });
+    return;
+  }
+  const profileId = String(rawEmail).trim().toLowerCase(); // use encodeURIComponent(...) if your tenant needs it
+
+  // 2) Build data with your schema (from your screenshot)
+  const data = {
+    source: String(first(sr.source, "retool")),           // Text
+    text:   String(first(sr.text, "from Retool")),        // Text
+    number: (() => { const n = Number(first(sr.number, 1)); return Number.isFinite(n) ? Math.trunc(n) : 0; })(), // Integer
+    numberWithDecimal: (() => { const f = parseFloat(first(sr.numberWithDecimal, 1.23)); return Number.isFinite(f) ? f : 0.0; })(), // Decimal
+    trueFalse: (() => {
+      const v = first(sr.trueFalse, false);
+      if (typeof v === "boolean") return v;
+      if (typeof v === "number")  return v !== 0;
+      if (typeof v === "string")  return v.trim().toLowerCase() === "true";
+      return false;
+    })()
+  };
+
+  const items = [{
+    event_time: new Date().toISOString(), // make sure your local clock is correct
+    version_id: 5208420,                  // your "testevent" version id
+    data
+  }];
+
+  console.log("POST body =>", JSON.stringify({ items }, null, 2));
+
+  // 3) POST
+  const postResp = await q_apsisAddEventAPI.trigger({
+    additionalScope: { email: profileId, items },
+    throwOnError: false
+  });
+  const postStatus = postResp?.status ?? postResp?.code ?? postResp?.responseStatus;
+  console.log("POST response =>", postResp);
+
+  if (!(postStatus === 200 || postStatus === 201 || (!postResp?.error && !postResp?.errors))) {
+    utils.showNotification({
+      title: "POST failed",
+      description: "APSIS did not accept the event. See console for details.",
+      notificationType: "error"
+    });
+    return;
+  }
+
+  // 4) Poll GET to confirm persistence (UI can lag a little)
+  const maxAttempts = 5;
+  const waitMs = 1000;
+
+  const found = async () => {
+    const getResp = await q_apsisGetProfileEvents.trigger({
+      additionalScope: { email: profileId },
+      throwOnError: false
+    });
+    console.log("GET response =>", getResp);
+
+    // Some Retool resources put data under .data, some return the array directly
+    const list = Array.isArray(getResp) ? getResp : (getResp?.data ?? getResp?.events ?? []);
+    if (!Array.isArray(list)) return false;
+
+    // Try to find our event by version_id and near-now event_time
+    const hit = list.find(ev => ev?.version_id === 5208420);
+    return Boolean(hit);
+  };
+
+  let ok = false;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      ok = await found();
+      if (ok) break;
+      await new Promise(r => setTimeout(r, waitMs));
+    } catch (e) {
+      console.log("GET check error:", e);
+    }
+  }
+
+  if (ok) {
+    utils.showNotification({
+      title: "Event added",
+      description: `Custom event stored for ${rawEmail}`,
+      notificationType: "success"
+    });
+  } else {
+    utils.showNotification({
+      title: "Posted, but not visible yet",
+      description: "Event POST succeeded, but it hasn’t appeared in the list yet. Try refreshing the APSIS UI or checking again in a minute.",
+      notificationType: "info"
+    });
+  }
+}
+
+addCustomEvent();

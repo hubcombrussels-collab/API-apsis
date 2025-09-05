@@ -1,0 +1,82 @@
+// q_checkApsisForAll — rock-solid 200/404 mapping
+
+function normalizeEmail(v) {
+  return String(v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\u200b/g, "")     // zero-width space
+    .replace(/\u00a0/g, "")     // non-breaking space
+    .replace(/\s+/g, "");       // stray spaces
+}
+
+function label(present) {
+  if (present === true)  return "In APSIS";
+  if (present === false) return "Not in APSIS";
+  return "Unknown";
+}
+
+// Single check: treat any resolved body (object) as 200 unless it clearly says 404
+async function checkOne(emailRaw) {
+  const e = normalizeEmail(emailRaw);
+  if (!e) return { email: null, present: false, status: "no_email" };
+
+  try {
+    const res = await q_apsisGetAttributes.trigger({
+      additionalScope: { email: e },   // raw; URL uses {{encodeURIComponent(email)}}
+      throwOnFailure: false
+    });
+
+    // `res` is often the BODY only. Derive status from body content.
+    let status = null;
+    if (res && typeof res === "object") {
+      const sc = res.status_code ?? res.status ?? null;
+      const msg = (res.message || res.title || res.detail || "").toString();
+
+      if (sc === 404 || /not\s*found/i.test(msg)) {
+        status = 404;
+      } else {
+        // Any non-error object (even empty) => treat as 200
+        status = 200;
+      }
+    }
+
+    if (status === 200) return { email: e, present: true,  status: 200 };
+    if (status === 404) return { email: e, present: false, status: 404 };
+    return { email: e, present: null, status: "unknown" };
+
+  } catch (err) {
+    // If Retool throws (e.g., 404 surfaced as failure)
+    const code = err?.response?.status ?? err?.status ?? err?.data?.status_code ?? null;
+    if (code === 404) return { email: e, present: false, status: 404 };
+    return { email: e, present: null, status: code ?? "error_throw" };
+  }
+}
+
+async function runAll() {
+  const baseRows = Array.isArray(q_fetchTally.data) ? q_fetchTally.data : [];
+  if (!baseRows.length) return [];
+
+  const enriched = await Promise.all(
+    baseRows.map(async (r, idx) => {
+      const rawEmail = r.email ?? r.Email ?? "";
+      const res = await checkOne(rawEmail);
+
+      // For debugging, keep what we decided per row
+      const dbg = `Row ${idx}: ${(r.email || r.Email || "").trim()} -> ${res.status}`;
+
+      return {
+        ...r,
+        Apsis: label(res.present),
+        _apsisStatus: res.status,      // number 200/404 or "unknown"
+        _apsisPresent: res.present,    // true/false/null
+        _apsisEmail: res.email,        // normalized
+        _debugInfo: dbg
+      };
+    })
+  );
+
+  console.log("APSIS per-row results:", enriched.map(r => ({ email: r.email || r.Email, _apsisStatus: r._apsisStatus, Apsis: r.Apsis })));
+  return enriched;
+}
+
+return await runAll();
